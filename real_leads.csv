@@ -1,0 +1,5 @@
+id,first_name,last_name,title,company,linkedin_url,email,search_snippet,company_domain,company_size,intent_score,ai_reasoning,is_qualified
+1,Lovstudio.AI,,Founder,Unknown Company,https://github.com/lovstudio,founder@lovstudio.ai,生命的意义在于创作,,201-500,80,"{  
+  ""score"": 5,  
+  ""reason"": ""The snippet \""生命的意义在于创作\"" contains no mention or implication of art...",True
+2,Paul,Nn,Founder,Twinstar by Pnacorp Inc.,https://github.com/nnaemek2,paul.nn@twinstarbypnacorpinc..com,"Dream Big, Dare to Succeed. Founder @pnacorp | Exploring the World 🌍 | Follow @izhan47 Co-Founder 🪐",twinstarbypnacorpinc..com,500+,80,"{""score"":5,""reason"":""The snippet mentions the user being a founder and co‑founder, but there’s no re...",True

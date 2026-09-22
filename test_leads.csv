@@ -1,0 +1,2 @@
+id,first_name,last_name,title,company,linkedin_url,email,company_size,recent_company_news,intent_score,is_qualified
+2,Bob,Jones,CTO,DataSphere LLC,https://linkedin.com/in/bobjones,bob@datasphere.example.com,10-50,Launched a new AI product.,85,True
