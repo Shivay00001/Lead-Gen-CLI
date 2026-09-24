@@ -1,84 +1,141 @@
-import logging
-import requests
-import urllib.parse
-from typing import List, Dict, Any
+"""
+Intent scoring via a real OpenAI-compatible chat-completions API.
 
-try:
-    import g4f
-    HAS_G4F = True
-except ImportError:
-    HAS_G4F = False
+Configuration (env vars, also accepted as constructor args):
+    OPENAI_API_KEY   - required for real scoring; without it every lead is
+                       marked "LLM unavailable" and the pipeline continues
+                       (no crash, no fake scores).
+    OPENAI_BASE_URL  - default https://api.openai.com/v1
+                       (any OpenAI-compatible endpoint works)
+    OPENAI_MODEL     - default gpt-4o-mini
+
+The old g4f (unofficial reverse-engineered client) and Pollinations.ai
+fallbacks have been removed: they were fragile, unauthenticated, and their
+"scores" were fabricated heuristics (score=80 when the word "score" appeared
+in the reply).
+"""
+
+import json
+import logging
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+import requests
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_MODEL = "gpt-4o-mini"
+QUALIFY_THRESHOLD = 60
+
+
 class IntentAnalyzer:
-    def __init__(self, openai_api_key: str = None):
-        # We don't need the key if we are using the free Pollinations AI endpoint or g4f
-        self.api_key = openai_api_key
+    def __init__(
+        self,
+        openai_api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
+        self.api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+        self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
+        self.model = model or os.environ.get("OPENAI_MODEL") or DEFAULT_MODEL
+
+    # -- LLM plumbing ------------------------------------------------------
+
+    def _chat(self, prompt: str, timeout: int = 30) -> str:
+        """One chat-completions call. Raises RuntimeError on any failure."""
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You score B2B sales leads. Reply with a single JSON object: "
+                        '{"score": <0-100 integer>, "reason": "<one sentence>"}.'
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as e:
+            raise RuntimeError(f"LLM request failed: {e}")
+        if resp.status_code != 200:
+            raise RuntimeError(f"LLM API returned {resp.status_code}: {resp.text[:200]}")
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, ValueError) as e:
+            raise RuntimeError(f"Unexpected LLM response shape: {e}")
+        return content
+
+    @staticmethod
+    def _parse_score(text: str) -> Optional[Dict[str, Any]]:
+        """Extract {"score", "reason"} from model output, tolerating fences/extra text."""
+        if not text:
+            return None
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        candidate = m.group(1) if m else text
+        try:
+            data = json.loads(candidate)
+        except ValueError:
+            m2 = re.search(r"\{[^{}]*\"score\"[^{}]*\}", text, re.DOTALL)
+            if not m2:
+                return None
+            try:
+                data = json.loads(m2.group(0))
+            except ValueError:
+                return None
+        try:
+            score = int(data["score"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        score = max(0, min(100, score))
+        return {"score": score, "reason": str(data.get("reason", ""))[:200]}
+
+    # -- pipeline step -------------------------------------------------------
 
     def score_intent(self, leads: List[Dict[str, Any]], keywords: str) -> List[Dict[str, Any]]:
-        """
-        Analyzes intent using g4f if available, otherwise falls back to Pollinations.ai API.
-        """
+        """Score each lead's buying intent. Degrades gracefully without a working key."""
         logger.info("Analyzing intent and buying signals...")
-        
+
         qualified_leads = []
-        
         for lead in leads:
             scored_lead = lead.copy()
-            snippet = lead.get("search_snippet", "")
-            
-            # Formulate the prompt for the AI
-            prompt = (f"Analyze this search snippet for a prospect named {lead.get('first_name')}. "
-                      f"Do they seem like a relevant '{keywords}' lead? "
-                      f"Reply with a single JSON object containing 'score' (0-100) and 'reason'. "
-                      f"Snippet: {snippet}")
-            
-            result_text = ""
-            success = False
-            
-            if HAS_G4F:
-                try:
-                    response = g4f.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    result_text = response.lower()
-                    success = True
-                except Exception as e:
-                    logger.warning(f"g4f failed, falling back to Pollinations: {e}")
-            
-            if not success:
-                encoded_prompt = urllib.parse.quote(prompt)
-                url = f"https://text.pollinations.ai/{encoded_prompt}?model=openai"
-                
-                try:
-                    response = requests.get(url, timeout=10)
-                    if response.status_code == 200:
-                        result_text = response.text.lower()
-                        success = True
-                    else:
-                        logger.error(f"Pollinations API failed with status {response.status_code}")
-                except Exception as e:
-                    logger.error(f"Failed to fetch AI intent: {e}")
-            
-            if success:
-                # Basic parsing (in real life, parse the JSON properly)
-                # We will do a heuristic extraction here
-                if "score" in result_text:
-                    scored_lead["intent_score"] = 80 # default high if it successfully evaluated
-                else:
-                    scored_lead["intent_score"] = 50
-                    
-                scored_lead["ai_reasoning"] = result_text[:100] + "..." # Truncated for display
-            else:
+            snippet = lead.get("search_snippet", "") or ""
+            prompt = (
+                f"Prospect: {lead.get('first_name', '')} {lead.get('last_name', '')} "
+                f"({lead.get('title', '')} at {lead.get('company', '')}). "
+                f"Target keywords: '{keywords}'. Bio/snippet: {snippet[:800]} "
+                "How relevant is this prospect as a lead? "
+                'Reply with a single JSON object: {"score": 0-100, "reason": "..."}.'
+            )
+            try:
+                raw = self._chat(prompt)
+                parsed = self._parse_score(raw)
+                if parsed is None:
+                    raise RuntimeError(f"Could not parse LLM output: {raw[:120]!r}")
+                scored_lead["intent_score"] = parsed["score"]
+                scored_lead["ai_reasoning"] = parsed["reason"]
+                scored_lead["is_qualified"] = parsed["score"] >= QUALIFY_THRESHOLD
+            except RuntimeError as e:
+                # Honest degradation: no fake score, pipeline continues.
+                logger.warning(f"Intent scoring skipped for lead {lead.get('id')}: {e}")
                 scored_lead["intent_score"] = 0
-                scored_lead["ai_reasoning"] = "Failed to analyze"
-            
-            if scored_lead["intent_score"] > 60:
-                scored_lead["is_qualified"] = True
-                qualified_leads.append(scored_lead)
-            else:
+                scored_lead["ai_reasoning"] = f"LLM unavailable: {e}"
                 scored_lead["is_qualified"] = False
-                
+
+            if scored_lead["is_qualified"]:
+                qualified_leads.append(scored_lead)
+
         return qualified_leads
